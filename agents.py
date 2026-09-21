@@ -27,6 +27,11 @@ Explicitly check for:
 If a category has no issues, say so explicitly rather than omitting it — an absent ACL is itself
 a finding, not a clean bill of health.
 
+Do not flag interface descriptions, VLAN/trunking correctness, static routing topology, NTP/SNMP,
+logging timestamps, banners, or other connectivity/operability concerns — those are covered by a
+separate troubleshooting review. Stay focused on access control and management-plane
+authentication/confidentiality.
+
 Output a numbered list of findings in the format above, then end with a one-line overall risk
 summary."""
 
@@ -87,8 +92,10 @@ Explicitly check for:
 - Anything that will make this config hard to operate or troubleshoot later (no hostname/banner,
   no timestamps on logging, no NTP/SNMP if the device's role suggests they'd matter)
 
-Do not re-flag ACL/access-control issues — that's covered by a separate security review. Focus
-on connectivity, correctness, and day-2 operability.
+Do not re-flag ACL/access-control issues, or management-plane authentication and confidentiality
+settings (service password-encryption, enable secret, vty login, telnet vs. ssh) — those are
+covered by a separate security review. Focus on connectivity, correctness, and day-2
+operability.
 
 Output a numbered list of findings in the format above, then end with a one-line overall health
 summary."""
@@ -115,6 +122,111 @@ them in where they affect connectivity or operability (e.g. note the operational
 security issue if relevant), and skip any ACL/access-control ground already covered there:
 ```
 {security_findings}
+```"""
+
+# --- Coordinator-worker pipeline ---
+
+COORDINATOR_SYSTEM = """You are a delegation coordinator for a network config analysis tool. Given a
+Cisco IOS device configuration, decide what each of three downstream reviewers should focus on,
+tailored to what's actually present in this specific config — not generic instructions that could
+apply to any config.
+
+The three reviewers are:
+- security: reviews access control and management-plane authentication/confidentiality (ACL rules,
+  service password-encryption, enable secret, vty/con/aux login, telnet vs. ssh).
+- ccna: explains commands and concepts for CCNA study purposes.
+- troubleshooting: reviews connectivity, correctness, and day-2 operability (routing, VLAN/trunking,
+  interface state, descriptions, NTP/SNMP/logging, legacy settings).
+
+For each reviewer, write one to three sentences of delegation instruction naming the specific things
+in *this* config to prioritize — e.g. if there is no ACL at all, tell security to lead with that
+absence rather than a generic ACL review; if a static route has no redundancy, tell troubleshooting
+to lead with that.
+
+Respond with ONLY a JSON object, no markdown code fences, no commentary before or after, in exactly
+this shape:
+{"security": "...", "ccna": "...", "troubleshooting": "..."}"""
+
+COORDINATOR_USER_TEMPLATE = """Read the following Cisco IOS device configuration and produce delegation
+instructions for the security, ccna, and troubleshooting reviewers.
+
+Config:
+```
+{config_text}
+```"""
+
+SECURITY_REVIEW_WITH_DELEGATION_TEMPLATE = """Analyze the following Cisco IOS device configuration for security issues.
+
+Config:
+```
+{config_text}
+```
+
+A coordinator reviewed this config first and flagged this as the priority for your review — don't
+ignore other issues if you see them, but make sure this is covered:
+```
+{delegation}
+```"""
+
+CCNA_EXPLAINER_WITH_DELEGATION_TEMPLATE = """Explain the following Cisco IOS device configuration for CCNA study purposes.
+
+Config:
+```
+{config_text}
+```
+
+A coordinator reviewed this config first and flagged this as the priority to emphasize in your
+study notes:
+```
+{delegation}
+```"""
+
+TROUBLESHOOTING_WITH_DELEGATION_TEMPLATE = """Review the following Cisco IOS device configuration for troubleshooting and optimization issues.
+
+Config:
+```
+{config_text}
+```
+
+A coordinator reviewed this config first and flagged this as the priority for your review — don't
+ignore other issues if you see them, but make sure this is covered:
+```
+{delegation}
+```"""
+
+SYNTHESIS_SYSTEM = """You are a synthesis editor merging three separate reviews of the same Cisco IOS
+device configuration — a security review, a troubleshooting/optimization review, and a CCNA
+study-note explainer — into one prioritized report for someone who wants the bottom line first.
+
+Do not just concatenate the three reviews. Instead:
+- Open with a short overall risk/health summary that weighs findings across all three reviews
+  together.
+- List the most urgent items first (Critical/High security findings and Misconfiguration-category
+  troubleshooting findings), regardless of which review they came from.
+- Note where a security finding and a troubleshooting finding relate to the same interface or line,
+  if any.
+- Keep the CCNA study notes as a distinct final section — they're reference material, not
+  prioritized findings, and shouldn't be interleaved with the findings above.
+
+Preserve the substance of each finding (severity/category, location, issue, fix) — you're
+reorganizing and prioritizing, not summarizing away detail."""
+
+SYNTHESIS_USER_TEMPLATE = """Merge the following three reviews of the same device configuration into
+one prioritized report.
+
+Security review:
+```
+{security_text}
+```
+
+Troubleshooting review:
+```
+{troubleshooting_text}
+```
+
+CCNA study notes:
+```
+{ccna_text}
 ```"""
 
 async def call_claude(

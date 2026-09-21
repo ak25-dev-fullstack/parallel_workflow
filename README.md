@@ -41,7 +41,7 @@ Given one config file, each subagent analyzes a different concern:
 `compare.py` runs all three pipelines against the same config and reports wall-clock latency
 and token usage for each, so the differences are measured, not just asserted.
 
-## Project structure (planned)
+## Project structure
 
 ```
 parallel_workflow/
@@ -50,12 +50,16 @@ parallel_workflow/
   test_setup.py            # phase 1 sanity check — confirms SDK/auth work
   sample_configs/
     basic_router.cfg       # hand-written sample config for testing
-  agents.py                # shared Claude call wrapper (async), model config
+  agents.py                # shared Claude call wrapper (async) + all system/user prompts
   pipelines/
     sequential.py
     parallel.py
     coordinator.py
   compare.py                # runs all 3 pipelines, prints latency + token comparison
+  run_security_review.py    # standalone single-call test of the security prompt
+  run_ccna_explainer.py     # standalone single-call test of the CCNA prompt
+  run_troubleshooting.py    # standalone single-call test of the troubleshooting prompt
+  results/                  # saved report .txt files from each pipeline run (git-ignored)
 ```
 
 ## Sourcing sample configs
@@ -74,7 +78,7 @@ Options, easiest first:
 `.venv` + `anthropic` + `python-dotenv`, `.env` holding `ANTHROPIC_API_KEY`,
 `test_setup.py` confirms the SDK and auth work.
 
-### Phase 1 — Single-call baseline (~30-45 min)
+### Phase 1 — Single-call baseline (~30-45 min) ✅ done
 One Claude call, one config file, one concern (start with the security review). Proves the
 prompt design works before adding concurrency.
 
@@ -88,7 +92,7 @@ Design questions to work through:
 **Checkpoint:** run against the sample config — does the output reference specific lines
 from *this* config, or could it have been written without reading it?
 
-### Phase 2 — Three prompts, three concerns (~30 min)
+### Phase 2 — Three prompts, three concerns (~30 min) ✅ done
 Write the CCNA-explainer and troubleshooting prompts the same way. Test each standalone
 before wiring up any pipeline.
 
@@ -96,16 +100,16 @@ Open design question: should all three subagents see the whole config, or should
 be filtered first? Full config to all three is the right choice for v1 — intelligent
 routing of what's relevant to whom is what makes coordinator-worker interesting later.
 
-### Phase 3 — Sequential pipeline (~30 min)
+### Phase 3 — Sequential pipeline (~30 min) ✅ done
 Three `await` calls in a row. Worth trying real chaining here — e.g. feed call 1's
 security findings into call 3's troubleshooting prompt, so sequential is doing something
 parallel structurally can't (using one step's output in the next).
 
-### Phase 4 — Parallel pipeline (~45-60 min)
+### Phase 4 — Parallel pipeline (~45-60 min) ✅ done
 `asyncio.gather` over the three independent analyses. This is where the real wall-clock
 speedup shows up, since the three angles are genuinely independent for a given config.
 
-### Phase 5 — Coordinator-worker (~60-90 min)
+### Phase 5 — Coordinator-worker (~60-90 min) ✅ done
 The most involved piece:
 1. Coordinator call reads the config, outputs a short delegation plan tailored to what's
    actually present in it.
@@ -116,16 +120,42 @@ This is the piece that earns the name "coordinator" rather than just being patte
 extra steps — worth the extra time, since it's the concept most likely to matter for the
 CCAR-F exam.
 
-### Phase 6 — compare.py (~30-45 min)
+### Phase 6 — compare.py (~30-45 min) ✅ done
 Wrap each pipeline call in `time.perf_counter()`, sum `usage.input_tokens` /
 `usage.output_tokens` across calls, print a comparison table. Run all three against the
 same input config.
 
+## Results
+
+`compare.py` run against `sample_configs/basic_router.cfg`:
+
+```
+pipeline     calls  elapsed (s)  in tokens  out tokens  total tokens
+--------------------------------------------------------------------
+sequential       3        63.63       5748        5854         11602
+parallel         3        25.48       3847        5711          9558
+coordinator      5        62.09      12061        9758         21819
+```
+
+- **Parallel is ~2.5x faster than sequential** for the same three concerns, and cheaper too
+  (troubleshooting isn't paying for the extra `security_findings` context) — the fan-out/fan-in
+  payoff shows up exactly where you'd expect for three independent concerns.
+- **Coordinator's wall-clock time lands close to sequential's**, not parallel's, even though its
+  three workers run concurrently — it has two more calls (delegation, synthesis) bookending that
+  parallel core, and those can't overlap with anything.
+- **Coordinator is the most expensive pipeline by tokens** (~2.3x parallel) — mostly the synthesis
+  call's input, which has to ingest all three workers' full output text to merge them.
+- The tradeoff: parallel wins on speed and cost when the three concerns are genuinely independent;
+  coordinator spends more time and tokens in exchange for per-worker instructions tailored to
+  what's actually in the config, and one prioritized report instead of three raw ones.
+
 ## Notes on models
 
-Workers use Claude Haiku 4.5 (cheap, fast — good for a project you'll re-run often while
-learning); the coordinator and sequential steps use Claude Sonnet 5 for better synthesis
-quality.
+All three pipelines currently use Claude Sonnet 5 for every call (workers included), rather than
+mixing in Haiku 4.5 for workers as originally planned — kept deliberately consistent across
+pipelines so the latency/token comparison in `compare.py` reflects the orchestration pattern
+itself, not a model-choice difference. Swapping workers to Haiku 4.5 would be a reasonable next
+experiment, but the two shouldn't be changed in the same comparison run.
 
 ## Next test config ideas (once the basic version works)
 
