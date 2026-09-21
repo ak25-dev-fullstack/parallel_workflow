@@ -1,0 +1,297 @@
+=== SECURITY REVIEW ===
+1. **Severity:** Critical
+**Location:** `access-list 101` (line 4: `permit ip any any`)
+**Issue:** The final rule permits all IP traffic from any source to any destination, negating the purpose of the three preceding specific rules. This ACL is effectively equivalent to no filtering at all on GigabitEthernet0/1 (the WAN-facing interface).
+**Fix:** Remove the `permit ip any any` line and replace with an explicit deny, or scope it to necessary return traffic:
+```
+no access-list 101 permit ip any any
+access-list 101 deny ip any any log
+```
+
+2. **Severity:** High
+**Location:** GigabitEthernet0/1, `ip access-group 101 in`
+**Issue:** ACL 101 is only applied inbound. There is no outbound ACL, so no control is exercised over what leaves the network toward the internet (relevant for egress filtering, spoofing prevention, data exfiltration).
+**Fix:** Define and apply an outbound ACL if egress control is desired, e.g.:
+```
+ip access-list extended 101-OUT
+ permit ip 192.168.10.0 0.0.0.255 any
+ permit ip 192.168.20.0 0.0.0.255 any
+ deny ip any any
+!
+interface GigabitEthernet0/1
+ ip access-group 101-OUT out
+```
+
+3. **Severity:** High
+**Location:** Sub-interfaces GigabitEthernet0/0.10 and GigabitEthernet0/0.20 (internal VLANs)
+**Issue:** No ACLs are applied to either internal VLAN interface. Given there are two separate VLANs (10 and 20) presumably requiring segmentation (e.g., 20 only got HTTPS access in ACL 101), there's nothing preventing VLAN 10 and VLAN 20 from communicating freely with each other through the router, undermining any segmentation intent.
+**Fix:** Add inter-VLAN filtering ACLs on the sub-interfaces, e.g.:
+```
+ip access-list extended VLAN10-IN
+ ...
+interface GigabitEthernet0/0.10
+ ip access-group VLAN10-IN in
+```
+(rules to be defined per intended segmentation policy)
+
+4. **Severity:** Critical
+**Location:** Global config — `no service password-encryption`
+**Issue:** Password encryption service is explicitly disabled. Any locally stored passwords (enable password, line passwords) would be stored in plaintext in the running/startup config.
+**Fix:**
+```
+service password-encryption
+```
+
+5. **Severity:** Critical
+**Location:** Global config — no `enable secret` or `enable password` present
+**Issue:** There is no privileged EXEC password configured at all. Anyone with console or vty access (once authenticated to line) can escalate to enable mode without a password.
+**Fix:**
+```
+enable secret <strong-password>
+```
+
+6. **Severity:** High
+**Location:** `line vty 0 4`
+**Issue:** Only `login` is configured with no `password` line and no indication of SSH-only access (`transport input`). Without a password set, `login` alone will lock out remote access or, depending on IOS defaults, may not properly enforce authentication. There's also no `transport input ssh` restricting to SSH, meaning telnet is allowed by default, transmitting credentials in plaintext.
+**Fix:**
+```
+line vty 0 4
+ login local
+ transport input ssh
+!
+username admin secret <strong-password>
+!
+ip domain-name example.com
+crypto key generate rsa modulus 2048
+```
+
+7. **Severity:** Medium
+**Location:** `line con 0`, `line aux 0`
+**Issue:** No `login` or password protection configured on console and aux lines. Physical or aux access would grant unauthenticated EXEC access.
+**Fix:**
+```
+line con 0
+ login local
+line aux 0
+ login local
+ no exec
+```
+
+8. **Severity:** Low
+**Location:** Global config
+**Issue:** No `service timestamps log/debug datetime msec` (both explicitly disabled) — this hampers log correlation and forensic analysis during incident investigation.
+**Fix:**
+```
+service timestamps log datetime msec
+service timestamps debug datetime msec
+```
+
+9. **Severity:** Informational/Medium
+**Location:** GigabitEthernet0/2, Gi0/0/0, Gi0/1/0, Vlan1
+**Issue:** These interfaces are correctly shut down — no issue here, but worth confirming they remain administratively down; no action needed, listed for completeness of ACL/interface review.
+**Fix:** None required; maintain `shutdown` state unless activated with corresponding ACLs.
+
+**Overall risk summary:** The router's effectively-unfiltered ACL, absent enable secret, plaintext password storage, and lack of SSH/authentication hardening on management lines combine to create a critical, easily-exploitable exposure of both the internal networks and the device's administrative control plane.
+
+=== CCNA EXPLAINER ===
+# CCNA Study Notes: Router Configuration Analysis
+
+## Global Settings
+```
+version 15.1
+no service timestamps log datetime msec
+no service password-encryption
+hostname Router
+no ip cef
+no ipv6 cef
+```
+Basic device identity and global switches. `no service password-encryption` means any passwords configured would show in plaintext in the running-config (bad practice, but relevant for the "line vty" section below since no password is set anyway). `no ip cef` disables Cisco Express Forwarding — unusual for production but common in lab/simulation environments (e.g., Packet Tracer). **CCNA concept:** basic device management, password encryption service.
+
+## Spanning-Tree Mode
+```
+spanning-tree mode pvst
+```
+Sets STP to Per-VLAN Spanning Tree (PVST+), Cisco's default STP variant that runs a separate spanning-tree instance per VLAN. **CCNA concept:** STP fundamentals — loop prevention on switched networks.
+
+## Router-on-a-Stick Subinterfaces (GigabitEthernet0/0)
+```
+interface GigabitEthernet0/0
+ no ip address
+ no shutdown
+
+interface GigabitEthernet0/0.10
+ encapsulation dot1Q 10
+ ip address 192.168.10.1 255.255.255.0
+
+interface GigabitEthernet0/0.20
+ encapsulation dot1Q 20
+ ip address 192.168.20.1 255.255.255.0
+```
+The physical interface Gi0/0 has no IP address itself — it's just enabled as a trunk-facing link. The actual routing happens on the **subinterfaces**, each tagged to a VLAN with `encapsulation dot1Q <vlan-id>` and given the default gateway IP for that VLAN. This is the classic **"router-on-a-stick"** setup: one physical link carries multiple VLANs (10 and 20), and the router inter-VLAN routes between them. **CCNA concept:** 802.1Q trunking, inter-VLAN routing, subinterfaces.
+
+## WAN/Internet-Facing Interface with ACL (GigabitEthernet0/1)
+```
+interface GigabitEthernet0/1
+ ip address 203.0.113.2 255.255.255.252
+ no shutdown
+ ip access-group 101 in
+```
+This interface uses a /30 (255.255.255.252) — a classic point-to-point WAN link address, likely connecting to an ISP or upstream router (VLSM in action — tiny subnet, only 2 usable hosts). The `ip access-group 101 in` applies ACL 101 to **inbound** traffic on this interface — meaning it filters traffic coming from the internet side toward the LAN, or filters traffic sourced from the LAN as it enters here (depends on ACL direction/logic, see below). **CCNA concept:** VLSM, applying ACLs to interfaces (in vs out).
+
+## Unused/Disabled Interfaces
+```
+interface GigabitEthernet0/2 — shutdown
+interface GigabitEthernet0/0/0 — shutdown
+interface GigabitEthernet0/1/0 — shutdown
+interface Vlan1 — shutdown
+```
+All unused interfaces are administratively shut down — good security/operational practice to disable ports not in use. `Vlan1` is the default SVI, left down since routing is handled via the dot1Q subinterfaces instead. **CCNA concept:** interface administrative state, security best practice of disabling unused ports.
+
+## Access List 101 (Extended ACL)
+```
+access-list 101 permit tcp 192.168.10.0 0.0.0.255 any eq 80
+access-list 101 permit tcp 192.168.10.0 0.0.0.255 any eq 443
+access-list 101 permit tcp 192.168.20.0 0.0.0.255 any eq 443
+access-list 101 permit ip any any
+```
+This is a numbered **extended ACL** (100–199 range = extended, allows matching on protocol/port, not just source). It permits:
+- VLAN 10 hosts to reach any destination on HTTP (80) and HTTPS (443)
+- VLAN 20 hosts to reach any destination on HTTPS (443) only
+
+The final `permit ip any any` is a catch-all that allows everything else — meaning despite specific rules above, this ACL doesn't actually restrict anything (the explicit permits are effectively redundant given the final permit-all, unless the intent was different, e.g., it was meant to *deny* other traffic but wasn't). This is a good real-world lesson on ACL design: **without explicit deny statements, the specific permits accomplish nothing** because everything else is still allowed by the last line. Wildcard masks (`0.0.0.255`) match an entire /24 subnet. **CCNA concept:** extended ACLs, wildcard masks, ACL logic/order of operations, implicit vs explicit rules.
+
+## Static Default Route
+```
+ip route 0.0.0.0 0.0.0.0 203.0.113.1
+ip classless
+```
+A default static route sending all otherwise-unmatched traffic to 203.0.113.1 — the next hop out GigabitEthernet0/1, presumably toward the ISP/internet. `ip classless` (default enabled anyway in modern IOS) allows forwarding to the best-matching route even without a classful major-network match. **CCNA concept:** static vs. default routing, routing table lookup behavior.
+
+## NetFlow Export
+```
+ip flow-export version 9
+```
+Configures NetFlow to export flow records using version 9 format (supports variable templates, useful for monitoring). Not core to CCNA exam but sometimes seen in configs — minor traffic monitoring feature.
+
+## Line Configuration
+```
+line con 0
+line aux 0
+line vty 0 4
+ login
+```
+VTY lines (0–4) allow up to 5 simultaneous Telnet/SSH sessions, and `login` requires a password prompt — **but no password is actually set**, meaning remote login would fail/lock out until a password is configured. Console and AUX lines have no restrictions configured. **CCNA concept:** line-level vs. enable/privileged passwords, remote access security (Telnet/SSH), the difference between `login` and `login local`.
+
+---
+
+## Key CCNA Topics Covered
+- **802.1Q trunking & router-on-a-stick** (subinterfaces, encapsulation dot1Q)
+- **Inter-VLAN routing**
+- **VLSM / subnetting** (use of /30 for point-to-point WAN link)
+- **Static and default routing**
+- **Extended ACLs and wildcard masks** (numbered 100–199, port-based filtering)
+- **ACL logic pitfalls** (implicit/explicit permit-all negating specific rules)
+- **Interface administrative state** (shutdown for unused ports — security hygiene)
+- **Spanning-Tree Protocol** (PVST+ mode)
+- **Line-level authentication** (`login` without password = access issue)
+- **Password encryption service** (plaintext passwords risk)
+
+=== TROUBLESHOOTING (chained on security findings) ===
+1. **Category:** Optimization
+**Location:** `no ip cef` / `no ipv6 cef` (global)
+**Issue:** CEF is disabled, forcing the router to use slower process/fast switching paths for all traffic, including inter-VLAN routing between Gi0/0.10 and Gi0/0.20 and WAN traffic on Gi0/1. On an ISR2911 this significantly reduces throughput and increases CPU load under load.
+**Fix:**
+```
+ip cef
+ipv6 cef
+```
+
+2. **Category:** Missing Best Practice
+**Location:** GigabitEthernet0/0, GigabitEthernet0/0.10, GigabitEthernet0/0.20, GigabitEthernet0/1
+**Issue:** None of the active interfaces have a `description` set. With two VLAN sub-interfaces and a WAN link in play, troubleshooting later (e.g. figuring out which link is the WAN uplink vs. internal VLANs) will be slower without labels.
+**Fix:**
+```
+interface GigabitEthernet0/1
+ description WAN uplink to ISP - 203.0.113.1
+interface GigabitEthernet0/0.10
+ description Internal VLAN10 - Users
+interface GigabitEthernet0/0.20
+ description Internal VLAN20 - Restricted
+interface GigabitEthernet0/0
+ description Trunk to switch (802.1Q parent for Gi0/0.10 & .20)
+```
+
+3. **Category:** Misconfiguration
+**Location:** `ip route 0.0.0.0 0.0.0.0 203.0.113.1` / GigabitEthernet0/1
+**Issue:** Single static default route via a single WAN interface with no redundancy and no verification (no track/SLA object). If Gi0/1 or the upstream 203.0.113.1 peer fails, there is no failover path and no fast detection of failure — outage will persist until manually noticed.
+**Fix:** Add IP SLA tracking on the default route, or a backup path if a second uplink exists:
+```
+ip sla 1
+ icmp-echo 203.0.113.1
+ frequency 10
+ip sla schedule 1 life forever start-time now
+ip route 0.0.0.0 0.0.0.0 203.0.113.1 track 1
+```
+
+4. **Category:** Missing Best Practice
+**Location:** GigabitEthernet0/0 (trunk parent interface)
+**Issue:** The parent interface Gi0/0 has `no ip address` and carries only dot1Q sub-interfaces, but there's no explicit statement of which VLAN is native versus tagged. If the neighboring switch trunk assumes a different native VLAN (default VLAN1), untagged traffic will be silently mishandled, and VLAN1 (Vlan1 interface, shut) is not part of the design, potentially causing confusion since native VLAN is not explicitly declared on either dot1Q sub-interface.
+**Fix:** Explicitly define a native VLAN sub-interface or tag native traffic to avoid ambiguity:
+```
+interface GigabitEthernet0/0.1
+ encapsulation dot1Q 1 native
+```
+(or configure matching native VLAN on the switch side and document it)
+
+5. **Category:** Missing Best Practice
+**Location:** Global config
+**Issue:** No `banner motd` or `banner login` configured. Combined with no timestamps and no logging host, this makes unauthorized/attempted access harder to notice and complicates change tracking during troubleshooting sessions with multiple engineers.
+**Fix:**
+```
+banner motd ^Authorized access only. All activity is logged.^
+```
+
+6. **Category:** Missing Best Practice
+**Location:** Global config
+**Issue:** No NTP configuration present. Combined with previously-flagged disabled timestamps, any log correlation across this router and other network devices during an incident will be very difficult since clocks may drift or not be synchronized at all.
+**Fix:**
+```
+ntp server <internal-ntp-server-ip>
+clock timezone <TZ> <offset>
+```
+
+7. **Category:** Missing Best Practice
+**Location:** Global config
+**Issue:** No SNMP configuration exists for monitoring, and no `logging host` is defined to centralize syslog. For a router serving as the WAN edge/VLAN gateway, this leaves no remote visibility into interface status changes, CPU/memory issues, or ACL hits, making day-2 operations reactive rather than proactive.
+**Fix:**
+```
+logging host <syslog-server-ip>
+logging trap informational
+snmp-server community <string> RO
+snmp-server host <nms-ip> version 2c <string>
+```
+
+8. **Category:** Optimization
+**Location:** `ip flow-export version 9` (global)
+**Issue:** Flow export is configured but there's no corresponding `ip flow-export destination <ip> <port>` and no `ip flow monitor`/NetFlow enabled on any interface. As configured, this line has no effect — flow data isn't actually being collected or exported anywhere, giving a false impression of traffic visibility.
+**Fix:**
+```
+ip flow-export destination <collector-ip> 2055
+interface GigabitEthernet0/1
+ ip flow ingress
+ ip flow egress
+```
+
+9. **Category:** Optimization
+**Location:** GigabitEthernet0/0, GigabitEthernet0/1
+**Issue:** `duplex auto` / `speed auto` on a router uplink and trunk parent is generally fine, but for a fixed WAN handoff (Gi0/1 to ISP) this is often a point of mismatch/troubleshooting difficulty if the ISP side is hard-set — half/full duplex mismatches cause hard-to-diagnose intermittent performance issues rather than outright failure.
+**Fix:** Confirm ISP-side settings and hardcode if the far end is not auto-negotiating:
+```
+interface GigabitEthernet0/1
+ speed 1000
+ duplex full
+```
+
+**Overall health summary:** The configuration is functional for basic routing/VLAN separation but suffers from disabled CEF (performance), a single non-redundant default route, missing interface descriptions, no NTP/SNMP/logging-host visibility, and an inert flow-export configuration — collectively making the device harder to operate, monitor, and troubleshoot in production.
+
+--- elapsed: 65.52s, total tokens: 11609
